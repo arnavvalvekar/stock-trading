@@ -1,0 +1,75 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+ENV/
+env/
+.env
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Project specific
+data/raw/*
+data/processed/*
+models/saved/*
+logs/*
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+!models/saved/.gitkeep
+!logs/.gitkeep
+
+# Testing
+.coverage
+htmlcov/
+.pytest_cache/
+.tox/
+coverage.xml
+*.cover
+
+# Documentation
+docs/build/
+docs/_build/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb
+
+# Distribution
+dist/
+build/
+*.egg-info/
+
+# Logs
+*.log
+*.log.*
+
+# Local development
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local 
