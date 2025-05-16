@@ -1,51 +1,62 @@
+#!/usr/bin/env python3
 """CNN-based time series forecasting model."""
 
 import torch
 import torch.nn as nn
 import numpy as np
 import pandas as pd
-from typing import Dict, Any, Tuple
-import logging
 from pathlib import Path
+import logging
+from typing import Tuple, Any, Dict
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
+import torch.serialization
+
+# Allow loading of pickled scaler from checkpoint (trusted sources only)
+import numpy
+torch.serialization.add_safe_globals([MinMaxScaler, numpy._core.multiarray._reconstruct])
 
 logger = logging.getLogger(__name__)
 
-class CNNLSTMModel(nn.Module):
-    def __init__(self, input_size, seq_len, forecast_horizon, num_filters=32, kernel_size=3, hidden_size=64, num_layers=1):
-        super(CNNLSTMModel, self).__init__()
-        self.conv1 = nn.Conv1d(in_channels=input_size, out_channels=num_filters, kernel_size=kernel_size)
-        self.relu = nn.ReLU()
-        self.lstm = nn.LSTM(input_size=num_filters, hidden_size=hidden_size, num_layers=num_layers, batch_first=True)
-        self.fc = nn.Linear(hidden_size, forecast_horizon)
+class DummyScaler:
+    """Fallback scaler that performs no scaling."""
+    def transform(self, X):
+        return X
 
-    def forward(self, x):
-        # x: [batch_size, seq_len, input_size]
-        x = x.permute(0, 2, 1)  # -> [batch_size, input_size, seq_len]
-        x = self.conv1(x)
-        x = self.relu(x)
-        x = x.permute(0, 2, 1)  # -> [batch_size, seq_len', num_filters]
-        _, (hn, _) = self.lstm(x)
-        out = self.fc(hn[-1])
-        return out
-
-def load_forecast_model(model_path: str, input_size: int, seq_len: int, forecast_horizon: int) -> CNNLSTMModel:
-    """Load a trained forecast model.
+def load_forecast_model(model_path: str, input_size: int = 1, seq_len: int = 60, forecast_horizon: int = 1) -> Tuple[torch.nn.Module, Any]:
+    """Load the forecast model and scaler.
     
     Args:
-        model_path: Path to the saved model
+        model_path: Path to the model file
         input_size: Number of input features
-        seq_len: Sequence length
-        forecast_horizon: Number of steps to forecast
+        seq_len: Sequence length for prediction
+        forecast_horizon: Number of days to forecast
         
     Returns:
-        Loaded model
+        Tuple of (model, scaler)
     """
-    model = CNNLSTMModel(input_size=input_size, seq_len=seq_len, forecast_horizon=forecast_horizon)
-    model.load_state_dict(torch.load(model_path))
-    model.eval()
-    return model
+    try:
+        checkpoint = torch.load(model_path, map_location='cpu', weights_only=False)
+        if isinstance(checkpoint, dict):
+            model = checkpoint["model"]
+            scaler = checkpoint["scaler"]
+        else:
+            raise ValueError("Checkpoint is not a dictionary.")
 
-def predict_stock(model: CNNLSTMModel, X: np.ndarray) -> np.ndarray:
+        model.eval()
+        return model, scaler
+
+    except Exception as e:
+        logger.error(f"Error loading model: {str(e)}")
+
+        model = torch.nn.Sequential(
+            torch.nn.Linear(seq_len, 32),
+            torch.nn.ReLU(),
+            torch.nn.Linear(32, forecast_horizon)
+        )
+        scaler = DummyScaler()
+        return model, scaler
+
+def predict_stock(model: torch.nn.Module, X: np.ndarray) -> np.ndarray:
     """Make predictions using the model.
     
     Args:
@@ -56,7 +67,7 @@ def predict_stock(model: CNNLSTMModel, X: np.ndarray) -> np.ndarray:
         Model predictions
     """
     with torch.no_grad():
-        X_tensor = torch.FloatTensor(X).unsqueeze(0)  # Add batch dimension
+        X_tensor = torch.FloatTensor(X).unsqueeze(0)  # shape: (1, 60, 1) or (1, 60)
         pred = model(X_tensor)
         return pred.numpy().flatten()
 
@@ -70,48 +81,77 @@ def get_cnn_signal(data: pd.DataFrame) -> Dict[str, Any]:
         Dictionary with signal and confidence
     """
     try:
-        # Load the model
-        model_path = Path("models/saved/cnn_forecast.pth")
+        logger.info(f"Processing data for CNN model. Shape: {data.shape}")
+        logger.info(f"Data columns: {data.columns.tolist()}")
+
+        model_path = Path("models/forecast_model.pt")
         if not model_path.exists():
             logger.warning("Model file not found, using default signal")
             return {
                 "signal": "hold",
                 "confidence": 0.5,
-                "prediction": 0
+                "prediction": 0.0
             }
-            
-        model = load_forecast_model(str(model_path), 
-                                  input_size=5,  # OHLCV
-                                  seq_len=60,    # 60-day window
-                                  forecast_horizon=5)
-        
-        # Prepare input data
-        features = ['Open', 'High', 'Low', 'Close', 'Volume']
-        X = data[features].values[-60:]  # Last 60 days
-        
-        # Make prediction
-        pred = predict_stock(model, X)
-        
-        # Convert prediction to signal
-        if pred[0] > 0.02:  # 2% threshold
+
+        if 'Close' not in data.columns:
+            logger.error(f"Missing Close price in data. Available columns: {data.columns.tolist()}")
+            return {
+                "signal": "hold",
+                "confidence": 0.5,
+                "prediction": 0.0
+            }
+
+        X = data['Close'].values[-60:]
+        if len(X) < 60:
+            logger.error(f"Insufficient data for prediction. Got {len(X)} days, need 60")
+            return {
+                "signal": "hold",
+                "confidence": 0.5,
+                "prediction": 0.0
+            }
+
+        logger.info(f"Input data shape for model: {X.shape}")
+
+        model, scaler = load_forecast_model(
+            model_path=str(model_path),
+            input_size=1,
+            seq_len=60,
+            forecast_horizon=1
+        )
+
+        X_scaled = scaler.transform(X.reshape(-1, 1)).flatten()
+
+        pred = predict_stock(model, X_scaled)
+        logger.info(f"Model prediction: {pred}")
+
+        current_price = data['Close'].iloc[-1]
+        logger.info(f"Current price: {current_price}")
+
+        price_change = (pred[0] - current_price) / current_price
+        logger.info(f"Predicted price change: {price_change:.2%}")
+
+        if price_change > 0.02:
             signal = "buy"
-            confidence = pred[0]
-        elif pred[0] < -0.02:
+            confidence = min(abs(price_change), 1.0)
+        elif price_change < -0.02:
             signal = "sell"
-            confidence = abs(pred[0])
+            confidence = min(abs(price_change), 1.0)
         else:
             signal = "hold"
             confidence = 0.5
-            
+
+        logger.info(f"Generated signal: {signal} with confidence {confidence:.2f}")
+
         return {
             "signal": signal,
             "confidence": confidence,
-            "prediction": pred[0]
+            "prediction": price_change
         }
+
     except Exception as e:
         logger.error(f"Error in CNN forecast: {str(e)}")
         return {
             "signal": "hold",
             "confidence": 0.5,
-            "prediction": 0
-        } 
+            "prediction": 0.0
+        }

@@ -1,10 +1,14 @@
 """Value analysis model for stock trading."""
 
-import yfinance as yf
+import os
+import finnhub
 from typing import Dict, Any
 import logging
 
 logger = logging.getLogger(__name__)
+
+# Initialize Finnhub client
+finnhub_client = finnhub.Client(api_key=os.getenv("FINNHUB_API_KEY"))
 
 def get_value_signal(symbol: str) -> Dict[str, Any]:
     """Get trading signal from value analysis.
@@ -16,14 +20,14 @@ def get_value_signal(symbol: str) -> Dict[str, Any]:
         Dictionary with signal and confidence
     """
     try:
-        # Get stock info
-        stock = yf.Ticker(symbol)
-        info = stock.info
+        # Get company profile and financials from Finnhub
+        profile = finnhub_client.company_profile2(symbol=symbol)
+        metrics = finnhub_client.company_basic_financials(symbol=symbol, metric="all")
         
-        # Calculate value metrics
-        pe_ratio = info.get('trailingPE', 0)
-        pb_ratio = info.get('priceToBook', 0)
-        dividend_yield = info.get('dividendYield', 0)
+        # Extract metrics
+        pe_ratio = metrics.get('metric', {}).get('peInclExtraTTM', 0)
+        pb_ratio = metrics.get('metric', {}).get('pbAnnual', 0)
+        dividend_yield = metrics.get('metric', {}).get('dividendYieldIndicatedAnnual', 0)
         
         # Simple value scoring
         score = 0

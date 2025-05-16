@@ -7,6 +7,7 @@ from typing import Callable, Any, TypeVar, Optional, Tuple, Type, Union
 import requests
 from requests.exceptions import RequestException
 import yfinance as yf
+import finnhub
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -31,52 +32,109 @@ class ConfigurationError(StockAIError):
     """Error raised when configuration is invalid."""
     pass
 
-def retry_on_exception(
-    max_attempts: int = 3,
-    delay: float = 1.0,
-    exceptions: Optional[Tuple[Type[Exception], ...]] = None
-) -> Callable[[F], F]:
-    """Decorator to retry a function on exception.
+def handle_finnhub_errors(func: F) -> F:
+    """Decorator to handle Finnhub-specific errors.
     
     Args:
-        max_attempts: Maximum number of attempts
-        delay: Delay between attempts in seconds
-        exceptions: Tuple of exceptions to catch
+        func: Function to decorate
     
     Returns:
         Decorated function
     """
-    if exceptions is None:
-        exceptions = (Exception,)
+    @functools.wraps(func)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        try:
+            return func(*args, **kwargs)
+        except finnhub.exceptions.FinnhubAPIException as e:
+            raise DataFetchError(f"Finnhub API error: {str(e)}")
+        except Exception as e:
+            raise DataFetchError(f"Finnhub error: {str(e)}")
 
+    return wrapper  # type: ignore
+
+def retry_on_exception(
+    max_retries: int = 3,
+    delay: float = 1.0,
+    exceptions: Tuple[Type[Exception], ...] = (Exception,)
+) -> Callable[[F], F]:
+    """Decorator to retry a function on exception.
+    
+    Args:
+        max_retries: Maximum number of retries
+        delay: Delay between retries in seconds
+        exceptions: Tuple of exceptions to catch
+        
+    Returns:
+        Decorated function
+    """
     def decorator(func: F) -> F:
         @functools.wraps(func)
         def wrapper(*args: Any, **kwargs: Any) -> Any:
-            current_delay = delay
             last_exception = None
-
-            for attempt in range(max_attempts):
+            for attempt in range(max_retries):
                 try:
                     return func(*args, **kwargs)
                 except exceptions as e:
                     last_exception = e
-                    func_name = getattr(func, '__name__', str(func))
-                    logger.warning(
-                        f"Attempt {attempt + 1} failed for {func_name}: {str(e)}. "
-                        f"{'Retrying in ' + str(current_delay) + 's' if attempt < max_attempts - 1 else 'Max attempts reached'}"
-                    )
-                    if attempt < max_attempts - 1:
-                        time.sleep(current_delay)
-                        current_delay *= 2  # Exponential backoff
-
-            if last_exception is not None:
-                raise last_exception
-
-            return None  # Should never reach here
-
+                    if attempt < max_retries - 1:
+                        time.sleep(delay * (attempt + 1))
+            raise last_exception  # type: ignore
         return wrapper  # type: ignore
-
     return decorator
+
+def cleanup_on_error(func: F) -> F:
+    """Decorator to perform cleanup on error.
+    
+    Args:
+        func: Function to decorate
+        
+    Returns:
+        Decorated function
+    """
+    @functools.wraps(func)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            logger.error(f"Error in {func.__name__}: {str(e)}")
+            # Add cleanup logic here
+            raise
+    return wrapper  # type: ignore
+
+class ErrorHandler:
+    """Error handler for stock trading AI."""
+    
+    @staticmethod
+    def handle_api_error(error: Exception) -> None:
+        """Handle API errors.
+        
+        Args:
+            error: Exception to handle
+        """
+        if isinstance(error, finnhub.exceptions.FinnhubAPIException):
+            logger.error(f"Finnhub API error: {str(error)}")
+        elif isinstance(error, RequestException):
+            logger.error(f"Request error: {str(error)}")
+        else:
+            logger.error(f"Unknown error: {str(error)}")
+
+def safe_api_call(func: F) -> F:
+    """Decorator to safely make API calls.
+    
+    Args:
+        func: Function to decorate
+        
+    Returns:
+        Decorated function
+    """
+    @functools.wraps(func)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            ErrorHandler.handle_api_error(e)
+            raise DataFetchError(f"API call failed: {str(e)}")
+    return wrapper  # type: ignore
 
 def handle_yfinance_errors(func: F) -> F:
     """Decorator to handle yfinance-specific errors.
@@ -95,56 +153,6 @@ def handle_yfinance_errors(func: F) -> F:
             raise DataFetchError(f"YFinance error: {str(e)}")
 
     return wrapper  # type: ignore
-
-def cleanup_on_error(func: F) -> F:
-    """Decorator to ensure cleanup on error.
-    
-    Args:
-        func: Function to decorate
-    
-    Returns:
-        Decorated function
-    """
-    @functools.wraps(func)
-    def wrapper(*args: Any, **kwargs: Any) -> Any:
-        try:
-            return func(*args, **kwargs)
-        except Exception as e:
-            if hasattr(args[0], 'cleanup'):
-                args[0].cleanup()
-            raise
-
-    return wrapper  # type: ignore
-
-class ErrorHandler:
-    """Context manager for error handling."""
-
-    def __init__(self, cleanup_func: Optional[Callable[[], None]] = None):
-        """Initialize error handler.
-        
-        Args:
-            cleanup_func: Optional cleanup function to call on error
-        """
-        self.cleanup_func = cleanup_func
-        self.original_error = None
-
-    def __enter__(self) -> 'ErrorHandler':
-        return self
-
-    def __exit__(self, exc_type: Optional[Type[BaseException]], 
-                 exc_val: Optional[BaseException], 
-                 exc_tb: Optional[Any]) -> bool:
-        if exc_type is not None:
-            self.original_error = exc_val
-            if self.cleanup_func is not None:
-                try:
-                    self.cleanup_func()
-                except Exception as cleanup_error:
-                    logger.error(f"Cleanup failed: {str(cleanup_error)}")
-                    # Re-raise the original error
-                    if self.original_error is not None:
-                        raise self.original_error
-        return False
 
 def safe_api_call(func: Callable[..., Any]) -> Callable[..., Any]:
     """Decorator for making safe API calls with retries and error handling.

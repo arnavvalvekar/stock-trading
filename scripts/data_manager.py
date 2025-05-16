@@ -1,6 +1,6 @@
 import os
 import pandas as pd
-import yfinance as yf
+import finnhub
 from datetime import datetime, timedelta
 import logging
 from typing import Dict, Optional, Tuple
@@ -32,6 +32,9 @@ class DataManager:
         # Load or create metadata
         self.metadata_file = self.metadata_dir / "data_metadata.json"
         self.metadata = self._load_metadata()
+        
+        # Initialize Finnhub client
+        self.finnhub_client = finnhub.Client(api_key=os.getenv("FINNHUB_API_KEY"))
 
     def _load_metadata(self) -> Dict:
         """Load metadata about data freshness and last updates."""
@@ -54,58 +57,53 @@ class DataManager:
         age = datetime.now() - last_update
         return age.total_seconds() < (max_age_hours * 3600)
 
-    def _validate_price_data(self, df: pd.DataFrame) -> bool:
-        """Validate price data for required columns and data quality."""
-        required_columns = ['Open', 'High', 'Low', 'Close', 'Volume']
-        
-        if not all(col in df.columns for col in required_columns):
-            logger.error(f"Missing required columns in price data: {required_columns}")
-            return False
-        
-        if df.isnull().sum().sum() > 0:
-            logger.warning("Price data contains null values")
-            return False
-        
-        return True
+    def _validate_price_data(self, data: pd.DataFrame) -> bool:
+        """Validate price data format and content."""
+        required_columns = ['c', 'h', 'l', 'o', 'v']  # Finnhub OHLCV columns
+        return all(col in data.columns for col in required_columns) and not data.empty
 
-    def _validate_fundamental_data(self, df: pd.DataFrame) -> bool:
-        """Validate fundamental data for required fields."""
-        required_fields = ['marketCap', 'trailingPE', 'trailingEps']
-        
-        if not all(field in df.columns for field in required_fields):
-            logger.error(f"Missing required fields in fundamental data: {required_fields}")
-            return False
-        
-        return True
+    def _validate_fundamental_data(self, data: pd.DataFrame) -> bool:
+        """Validate fundamental data format and content."""
+        required_columns = ['metric', 'value']
+        return all(col in data.columns for col in required_columns) and not data.empty
 
-    def _calculate_technical_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
+    def _calculate_technical_indicators(self, data: pd.DataFrame) -> pd.DataFrame:
         """Calculate technical indicators for price data."""
-        # Moving Averages
-        df['50_MA'] = df['Close'].rolling(window=50).mean()
-        df['200_MA'] = df['Close'].rolling(window=200).mean()
-
-        # RSI
-        delta = df['Close'].diff()
+        # Rename columns to match standard format
+        data = data.rename(columns={
+            'c': 'Close',
+            'h': 'High',
+            'l': 'Low',
+            'o': 'Open',
+            'v': 'Volume'
+        })
+        
+        # Calculate moving averages
+        data['50_MA'] = data['Close'].rolling(window=50).mean()
+        data['200_MA'] = data['Close'].rolling(window=200).mean()
+        
+        # Calculate RSI
+        delta = data['Close'].diff()
         gain = delta.where(delta > 0, 0)
         loss = -delta.where(delta < 0, 0)
         avg_gain = gain.rolling(window=14).mean()
         avg_loss = loss.rolling(window=14).mean()
         rs = avg_gain / avg_loss
-        df['RSI'] = 100 - (100 / (1 + rs))
-
-        # Bollinger Bands
-        rolling_mean = df['Close'].rolling(window=20).mean()
-        rolling_std = df['Close'].rolling(window=20).std()
-        df['Bollinger_Upper'] = rolling_mean + (rolling_std * 2)
-        df['Bollinger_Lower'] = rolling_mean - (rolling_std * 2)
-
-        # MACD
-        short_ema = df['Close'].ewm(span=12, adjust=False).mean()
-        long_ema = df['Close'].ewm(span=26, adjust=False).mean()
-        df['MACD'] = short_ema - long_ema
-        df['MACD_Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
-
-        return df
+        data['RSI'] = 100 - (100 / (1 + rs))
+        
+        # Calculate Bollinger Bands
+        rolling_mean = data['Close'].rolling(window=20).mean()
+        rolling_std = data['Close'].rolling(window=20).std()
+        data['Bollinger_Upper'] = rolling_mean + (rolling_std * 2)
+        data['Bollinger_Lower'] = rolling_mean - (rolling_std * 2)
+        
+        # Calculate MACD
+        short_ema = data['Close'].ewm(span=12, adjust=False).mean()
+        long_ema = data['Close'].ewm(span=26, adjust=False).mean()
+        data['MACD'] = short_ema - long_ema
+        data['MACD_Signal'] = data['MACD'].ewm(span=9, adjust=False).mean()
+        
+        return data
 
     def get_stock_data(self, ticker: str, force_refresh: bool = False) -> Tuple[pd.DataFrame, pd.DataFrame]:
         """
@@ -126,22 +124,42 @@ class DataManager:
             # Check if we need to update price data
             if force_refresh or not self._is_data_fresh(ticker, 'price_data'):
                 logger.info(f"Fetching fresh price data for {ticker}")
-                stock_data = yf.download(ticker, 
-                                      start=(datetime.now() - timedelta(days=365*5)).strftime('%Y-%m-%d'),
-                                      end=datetime.now().strftime('%Y-%m-%d'),
-                                      interval="1d")
                 
-                if not self._validate_price_data(stock_data):
+                # Get current timestamp and 5 years ago
+                end_timestamp = int(datetime.now().timestamp())
+                start_timestamp = int((datetime.now() - timedelta(days=365*5)).timestamp())
+                
+                # Fetch candlestick data from Finnhub
+                stock_data = self.finnhub_client.stock_candles(
+                    ticker,
+                    'D',  # Daily interval
+                    start_timestamp,
+                    end_timestamp
+                )
+                
+                if not stock_data or stock_data.get('s') != 'ok':
                     raise ValueError(f"Invalid price data for {ticker}")
                 
-                stock_data = self._calculate_technical_indicators(stock_data)
-                stock_data.to_csv(price_path)
+                # Convert to DataFrame
+                df = pd.DataFrame({
+                    'c': stock_data['c'],  # Close
+                    'h': stock_data['h'],  # High
+                    'l': stock_data['l'],  # Low
+                    'o': stock_data['o'],  # Open
+                    'v': stock_data['v']   # Volume
+                }, index=pd.to_datetime(stock_data['t'], unit='s'))
+                
+                if not self._validate_price_data(df):
+                    raise ValueError(f"Invalid price data for {ticker}")
+                
+                df = self._calculate_technical_indicators(df)
+                df.to_csv(price_path)
                 
                 # Update metadata
                 self.metadata[ticker] = {
                     'price_data': {
                         'last_update': datetime.now().isoformat(),
-                        'rows': len(stock_data)
+                        'rows': len(df)
                     }
                 }
                 self._save_metadata()
@@ -149,9 +167,26 @@ class DataManager:
             # Check if we need to update fundamental data
             if force_refresh or not self._is_data_fresh(ticker, 'fundamental_data'):
                 logger.info(f"Fetching fresh fundamental data for {ticker}")
-                stock = yf.Ticker(ticker)
-                info = stock.info
-                fundamental_df = pd.DataFrame.from_dict(info, orient="index", columns=[ticker])
+                
+                # Get company profile and financials
+                profile = self.finnhub_client.company_profile2(symbol=ticker)
+                metrics = self.finnhub_client.company_basic_financials(symbol=ticker, metric="all")
+                
+                # Combine data
+                fundamental_data = {
+                    'ticker': ticker,
+                    'name': profile.get('name'),
+                    'market_cap': profile.get('marketCapitalization'),
+                    'pe_ratio': metrics.get('metric', {}).get('peInclExtraTTM'),
+                    'pb_ratio': metrics.get('metric', {}).get('pbAnnual'),
+                    'roe': metrics.get('metric', {}).get('roeTTM'),
+                    'debt_equity': metrics.get('metric', {}).get('totalDebt/totalEquityAnnual'),
+                    'current_ratio': metrics.get('metric', {}).get('currentRatioAnnual'),
+                    'revenue_growth': metrics.get('metric', {}).get('revenueGrowthTTM'),
+                    'fcf_margin': metrics.get('metric', {}).get('freeCashFlowMarginTTM')
+                }
+                
+                fundamental_df = pd.DataFrame.from_dict(fundamental_data, orient='index', columns=[ticker])
                 
                 if not self._validate_fundamental_data(fundamental_df):
                     raise ValueError(f"Invalid fundamental data for {ticker}")

@@ -1,11 +1,11 @@
 # combines all models into one
 
-from models.forecast import get_cnn_signal
-from models.value_model import get_value_signal
-from models.sentiment import get_sentiment_signal
-from models.insider_model import get_insider_signal_wrapped as get_insider_signal
-from models.technical_patterns import get_technical_signal
-from models.macro_model import get_macro_signal
+from stock_trading_ai.models.forecast import get_cnn_signal
+from stock_trading_ai.models.value_model import get_value_signal
+from stock_trading_ai.models.sentiment import get_sentiment_signal
+from stock_trading_ai.models.insider_model import get_insider_signal_wrapped as get_insider_signal
+from stock_trading_ai.models.technical_patterns import get_technical_signal
+from stock_trading_ai.models.macro_model import get_macro_signal
 
 import pandas as pd
 import os
@@ -61,13 +61,13 @@ def log_decision(ticker, signals, final_signal, confidence, log_path="logs/ensem
     else:
         df.to_csv(log_path, index=False)
 
-def run_ensemble(ticker: str):
+def run_ensemble(ticker: str, data: pd.DataFrame = None):
     signals = [
-        get_cnn_signal(ticker),
+        get_cnn_signal(data) if data is not None else {"model_name": "cnn", "signal": "hold", "confidence": 0.5},
         get_value_signal(ticker),
-        get_sentiment_signal(ticker),
-        get_technical_signal(ticker),
-        get_insider_signal(ticker),
+        get_sentiment_signal(data, ticker) if data is not None else {"model_name": "sentiment", "signal": "hold", "confidence": 0.5},
+        get_technical_signal(data) if data is not None else {"model_name": "technical", "signal": "hold", "confidence": 0.5},
+        get_insider_signal(data, ticker) if data is not None else {"model_name": "insider", "signal": "hold", "confidence": 0.5},
         get_macro_signal(ticker)
     ]
 

@@ -16,78 +16,74 @@ def get_technical_signal(data: pd.DataFrame) -> Dict[str, Any]:
     Returns:
         Dictionary with signal and confidence
     """
+    data = data.apply(pd.to_numeric, errors='coerce')
     try:
+        if data.empty:
+            return {
+                "signal": "hold",
+                "confidence": 0.5,
+                "indicators": {}
+            }
+            
         # Calculate technical indicators
-        df = data.copy()
-        
-        # Moving averages
-        df['50_MA'] = df['Close'].rolling(window=50).mean()
-        df['200_MA'] = df['Close'].rolling(window=200).mean()
+        indicators = {}
         
         # RSI
-        delta = df['Close'].diff()
-        gain = delta.where(delta > 0, 0)
-        loss = -delta.where(delta < 0, 0)
-        avg_gain = gain.rolling(window=14).mean()
-        avg_loss = loss.rolling(window=14).mean()
-        rs = avg_gain / avg_loss
-        df['RSI'] = 100 - (100 / (1 + rs))
+        delta = data['Close'].diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+        rs = gain / loss
+        rsi = 100 - (100 / (1 + rs))
+        indicators['RSI'] = rsi.iloc[-1]
+        
+        # Moving Averages
+        data['50_MA'] = data['Close'].rolling(window=50).mean()
+        data['200_MA'] = data['Close'].rolling(window=200).mean()
+        indicators['50_MA'] = data['50_MA'].iloc[-1]
+        indicators['200_MA'] = data['200_MA'].iloc[-1]
         
         # MACD
-        exp1 = df['Close'].ewm(span=12, adjust=False).mean()
-        exp2 = df['Close'].ewm(span=26, adjust=False).mean()
-        df['MACD'] = exp1 - exp2
-        df['Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
+        exp1 = data['Close'].ewm(span=12, adjust=False).mean()
+        exp2 = data['Close'].ewm(span=26, adjust=False).mean()
+        macd = exp1 - exp2
+        macd_signal = macd.ewm(span=9, adjust=False).mean()
+        indicators['MACD'] = macd.iloc[-1]
+        indicators['MACD_Signal'] = macd_signal.iloc[-1]
         
-        # Get latest values
-        latest = df.iloc[-1]
+        # Generate signal based on indicators
+        trading_signal = "hold"
+        confidence = 0.5
         
-        # Generate signals
-        signals = []
-        
-        # Moving average crossover
-        if latest['50_MA'] > latest['200_MA']:
-            signals.append(("buy", 0.3))
-        else:
-            signals.append(("sell", 0.3))
+        # RSI signals
+        if rsi.iloc[-1] > 70:
+            trading_signal = "sell"
+            confidence = min((rsi.iloc[-1] - 70) / 30, 1.0)
+        elif rsi.iloc[-1] < 30:
+            trading_signal = "buy"
+            confidence = min((30 - rsi.iloc[-1]) / 30, 1.0)
             
-        # RSI
-        if latest['RSI'] < 30:
-            signals.append(("buy", 0.2))
-        elif latest['RSI'] > 70:
-            signals.append(("sell", 0.2))
-        else:
-            signals.append(("hold", 0.2))
+        # Moving Average signals
+        if data['50_MA'].iloc[-1] > data['200_MA'].iloc[-1] and data['50_MA'].iloc[-2] <= data['200_MA'].iloc[-2]:
+            trading_signal = "buy"
+            confidence = max(confidence, 0.7)
+        elif data['50_MA'].iloc[-1] < data['200_MA'].iloc[-1] and data['50_MA'].iloc[-2] >= data['200_MA'].iloc[-2]:
+            trading_signal = "sell"
+            confidence = max(confidence, 0.7)
             
-        # MACD
-        if latest['MACD'] > latest['Signal']:
-            signals.append(("buy", 0.2))
-        else:
-            signals.append(("sell", 0.2))
-            
-        # Combine signals
-        buy_score = sum(weight for signal, weight in signals if signal == "buy")
-        sell_score = sum(weight for signal, weight in signals if signal == "sell")
-        
-        if buy_score > sell_score:
-            signal = "buy"
-            confidence = buy_score
-        elif sell_score > buy_score:
-            signal = "sell"
-            confidence = sell_score
-        else:
-            signal = "hold"
-            confidence = 0.5
+        # MACD signals
+        if macd.iloc[-1] > macd_signal.iloc[-1] and macd.iloc[-2] <= macd_signal.iloc[-2]:
+            trading_signal = "buy"
+            confidence = max(confidence, 0.6)
+        elif macd.iloc[-1] < macd_signal.iloc[-1] and macd.iloc[-2] >= macd_signal.iloc[-2]:
+            trading_signal = "sell"
+            confidence = max(confidence, 0.6)
             
         return {
-            "signal": signal,
+            "signal": trading_signal,
             "confidence": confidence,
-            "indicators": {
-                "rsi": latest['RSI'],
-                "macd": latest['MACD'],
-                "signal_line": latest['Signal']
-            }
+            "indicators": indicators
         }
+        
     except Exception as e:
         logger.error(f"Error in technical analysis: {str(e)}")
         return {
